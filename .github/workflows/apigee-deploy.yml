@@ -1,0 +1,72 @@
+# .github/workflows/apigee-deploy.yml
+
+name: Deploy Apigee Proxy
+
+on:
+  push:
+    branches:
+      - main          # Triggers on every push to main branch
+
+jobs:
+  deploy:
+    name: Build and Deploy to Apigee
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      id-token: write   # REQUIRED: Allows GitHub to generate OIDC token for WIF
+
+    steps:
+
+      # Step 1: Check out your repository code
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      # Step 2: Authenticate to Google Cloud using Workload Identity Federation
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v1
+        with:
+          workload_identity_provider: ${{ secrets.WORKLOAD_IDENTITY_POOL_ID }}
+          service_account: ${{ secrets.SERVICE_ACCOUNT }}
+
+      # Step 3: Get a short-lived access token for Apigee API calls
+      - name: Get GCP Access Token
+        id: token
+        run: |
+          TOKEN=$(gcloud auth print-access-token)
+          echo "TOKEN=$TOKEN" >> $GITHUB_OUTPUT
+
+      # Step 4: Zip the apiproxy/ folder into a deployable bundle
+      - name: Create Apigee proxy bundle (ZIP)
+        run: |
+          cd apiproxy
+          zip -r ../proxy-bundle.zip .
+          cd ..
+          echo "Bundle created: proxy-bundle.zip"
+          ls -lh proxy-bundle.zip
+
+      # Step 5: Upload the ZIP to Apigee as a new proxy revision
+      - name: Upload proxy bundle to Apigee
+        id: upload
+        run: |
+          RESPONSE=$(curl -s -X POST \
+            "https://apigee.googleapis.com/v1/organizations/${{ secrets.APIGEE_ORG }}/apis?action=import&name=hello-world" \
+            -H "Authorization: Bearer ${{ steps.token.outputs.TOKEN }}" \
+            -H "Content-Type: application/octet-stream" \
+            --data-binary @proxy-bundle.zip)
+
+          echo "Upload response: $RESPONSE"
+          REVISION=$(echo $RESPONSE | python3 -c "import sys,json; print(json.load(sys.stdin)['revision'])")
+          echo "New revision: $REVISION"
+          echo "REVISION=$REVISION" >> $GITHUB_OUTPUT
+
+      # Step 6: Deploy the newly uploaded revision to the 'eval' environment
+      - name: Deploy revision to eval environment
+        run: |
+          RESPONSE=$(curl -s -X POST \
+            "https://apigee.googleapis.com/v1/organizations/${{ secrets.APIGEE_ORG }}/environments/eval/apis/hello-world/revisions/${{ steps.upload.outputs.REVISION }}/deployments" \
+            -H "Authorization: Bearer ${{ steps.token.outputs.TOKEN }}" \
+            -H "Content-Length: 0")
+
+          echo "Deploy response: $RESPONSE"
+          echo "✅ Deployed revision ${{ steps.upload.outputs.REVISION }} to eval environment"
